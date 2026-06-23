@@ -1,4 +1,13 @@
 import React, { useState, useRef, useEffect } from "react";
+import {
+  listarPersonas,
+  crearPersona,
+  actualizarEstatusPersona,
+  actualizarPersona,
+  listarPerfilesDePersona,
+  guardarPerfil,
+  perfilRowToForm,
+} from "./supabaseClient.jsx";
 
 /* ====================================================================
    EVOLXIA® WELLNESS PROFILE™ — GENERATION ENGINE (v2)
@@ -464,6 +473,612 @@ const OBESITY_LEVEL_OPTIONS = [
   "Obeso III",
 ];
 
+/* ====================================================================
+   MOTOR DE EVOLUCIÓN — compara el perfil actual contra el anterior
+   ==================================================================== */
+
+const EVOLUTION_FIELDS = [
+  { key: "peso", label: "Peso", unit: "lb", lowerIsBetter: null },
+  { key: "bmi", label: "BMI", unit: "", lowerIsBetter: null },
+  { key: "bfr", label: "% Grasa Corporal", unit: "%", lowerIsBetter: true },
+  { key: "muscleRate", label: "Tasa Muscular", unit: "%", lowerIsBetter: false },
+  { key: "bodyWater", label: "Agua Corporal", unit: "%", lowerIsBetter: false },
+  { key: "boneMass", label: "Masa Ósea", unit: "lb", lowerIsBetter: false },
+  { key: "bmr", label: "BMR", unit: "kcal", lowerIsBetter: false },
+  { key: "proteinRate", label: "Tasa de Proteína", unit: "%", lowerIsBetter: false },
+  { key: "edadMetabolica", label: "Edad Metabólica", unit: "años", lowerIsBetter: true },
+  { key: "grasaVisceral", label: "Grasa Visceral", unit: "", lowerIsBetter: true },
+  { key: "grasaSubcutanea", label: "Grasa Subcutánea", unit: "%", lowerIsBetter: true },
+  { key: "masaGrasa", label: "Masa Grasa", unit: "lb", lowerIsBetter: true },
+  { key: "masaMuscular", label: "Masa Muscular", unit: "lb", lowerIsBetter: false },
+];
+
+function compararPerfiles(actual, anterior) {
+  const cambios = [];
+  EVOLUTION_FIELDS.forEach((f) => {
+    const valActual = parseFloat(actual[f.key]);
+    const valAnterior = parseFloat(anterior[f.key]);
+    if (isNaN(valActual) || isNaN(valAnterior)) return;
+    const diff = valActual - valAnterior;
+    if (Math.abs(diff) < 0.01) {
+      cambios.push({ ...f, valActual, valAnterior, diff: 0, direction: "same" });
+      return;
+    }
+    const direction = diff > 0 ? "up" : "down";
+    let isGood = null;
+    if (f.lowerIsBetter === true) isGood = direction === "down";
+    if (f.lowerIsBetter === false) isGood = direction === "up";
+    cambios.push({ ...f, valActual, valAnterior, diff, direction, isGood });
+  });
+  return cambios;
+}
+
+/* Construye serie de tendencia (fecha + valor) para un campo a través de todo el historial */
+function buildTrendSeries(historial, fieldKey) {
+  return historial
+    .map((p) => ({ fecha: p.fechaEvaluacion, valor: parseFloat(p[fieldKey]) }))
+    .filter((p) => !isNaN(p.valor));
+}
+
+
+/* ====================================================================
+   MOTOR DE PROGRAMA DE TRANSFORMACIÓN
+   Calcula semanas necesarias a ritmo de hasta 2 lb/semana y lo encuadra
+   en los 3 paquetes estándar: 21, 45, 90 días.
+   ==================================================================== */
+
+const RITMO_MAX_LB_SEMANA = 2;
+
+function calcularProgramaRecomendado({ pesoLb, idealWeightLb, bfrPct, idealFatMidPct }) {
+  const librasAPerder = Math.max(0, pesoLb - idealWeightLb);
+  const puntosGrasaAPerder = Math.max(0, bfrPct - idealFatMidPct);
+
+  // Semanas necesarias según peso (ritmo máximo saludable-agresivo: 2 lb/semana)
+  const semanasPorPeso = librasAPerder / RITMO_MAX_LB_SEMANA;
+
+  // Aproximación: cada punto de % grasa a perder ~ requiere ~1 semana adicional de
+  // trabajo metabólico sostenido (regla práctica, no clínica)
+  const semanasPorGrasa = puntosGrasaAPerder * 1.0;
+
+  const semanasEstimadas = Math.max(semanasPorPeso, semanasPorGrasa);
+  const diasEstimados = Math.ceil(semanasEstimadas * 7);
+
+  let programaDias;
+  if (diasEstimados <= 21) programaDias = 21;
+  else if (diasEstimados <= 45) programaDias = 45;
+  else programaDias = 90;
+
+  return {
+    librasAPerder: Math.round(librasAPerder * 10) / 10,
+    puntosGrasaAPerder: Math.round(puntosGrasaAPerder * 10) / 10,
+    semanasEstimadas: Math.round(semanasEstimadas * 10) / 10,
+    diasEstimados,
+    programaDias,
+    programaLabel: `Protocolo Renacer ${programaDias}`,
+  };
+}
+
+
+/* ====================================================================
+   MOTOR DE SEGUIMIENTO — cadencia de contacto + mensajes pre-escritos
+   Días desde la fecha del perfil: 1, 3, 7, 10, 15, 20, 25, 30,
+   luego cada 15 días indefinidamente.
+   ==================================================================== */
+
+const CADENCIA_DIAS = [1, 3, 7, 10, 15, 20, 25, 30];
+
+function diasDesde(fechaStr) {
+  const fecha = new Date(fechaStr);
+  const hoy = new Date();
+  const diffMs = hoy.setHours(0, 0, 0, 0) - new Date(fecha).setHours(0, 0, 0, 0);
+  return Math.round(diffMs / (1000 * 60 * 60 * 24));
+}
+
+/* Determina si HOY corresponde hacer seguimiento, dado el día transcurrido desde el perfil */
+function tocaSeguimientoHoy(diasTranscurridos) {
+  if (diasTranscurridos < 0) return false;
+  if (CADENCIA_DIAS.includes(diasTranscurridos)) return true;
+  if (diasTranscurridos > 30 && (diasTranscurridos - 30) % 15 === 0) return true;
+  return false;
+}
+
+function proximoContactoTexto(diasTranscurridos) {
+  for (const d of CADENCIA_DIAS) {
+    if (d > diasTranscurridos) return `Día ${d}`;
+  }
+  // después del día 30, cada 15
+  const siguienteMultiplo = 30 + (Math.floor((diasTranscurridos - 30) / 15) + 1) * 15;
+  return `Día ${siguienteMultiplo}`;
+}
+
+function mensajeSeguimiento({ nombre, diasTranscurridos, coach, programaLabel }) {
+  let cuerpo;
+  if (diasTranscurridos <= 1) {
+    cuerpo = `¡Hola ${nombre}! 😊 Soy ${coach}. Quería saber cómo te sentiste después de tu EVOLXIA® Wellness Profile. ¿Tienes alguna duda sobre tus resultados?`;
+  } else if (diasTranscurridos <= 10) {
+    cuerpo = `Hola ${nombre}, ¿cómo vas? Recuerda que con base en tus resultados te recomendé el ${programaLabel || "programa de transformación"}. ¿Te gustaría que conversemos sobre cómo arrancar?`;
+  } else if (diasTranscurridos <= 30) {
+    cuerpo = `¡Hola ${nombre}! Ha pasado un tiempo desde tu evaluación de bienestar. Sigo aquí para acompañarte en tu transformación cuando estés listo(a). ¿Seguimos platicando?`;
+  } else {
+    cuerpo = `Hola ${nombre}, espero que estés muy bien. Te escribo para saber si ya es un buen momento para retomar tu plan de bienestar. Estoy aquí para ayudarte. 💪`;
+  }
+  return cuerpo;
+}
+
+function abrirWhatsApp(telefono, mensaje) {
+  const numeroLimpio = (telefono || "").replace(/[^\d+]/g, "");
+  const url = `https://wa.me/${numeroLimpio}?text=${encodeURIComponent(mensaje)}`;
+  window.open(url, "_blank");
+}
+
+function abrirEmail(email, asunto, mensaje) {
+  const url = `mailto:${email}?subject=${encodeURIComponent(asunto)}&body=${encodeURIComponent(mensaje)}`;
+  window.open(url, "_blank");
+}
+
+function abrirSMS(telefono, mensaje) {
+  const numeroLimpio = (telefono || "").replace(/[^\d+]/g, "");
+  // sms: URI scheme — funciona mejor en móvil
+  const url = `sms:${numeroLimpio}?body=${encodeURIComponent(mensaje)}`;
+  window.open(url, "_blank");
+}
+
+
+/* ====================================================================
+   GESTIÓN DE PERSONAS — lista, filtro por estatus, crear, cambiar estatus
+   ==================================================================== */
+
+const ESTATUS_OPTIONS = ["Cliente", "Prospecto", "Distribuidor", "Asociado Preferente"];
+
+const ESTATUS_COLORS = {
+  Cliente: "#8BFF00",
+  Prospecto: "#00C8FF",
+  Distribuidor: "#FF8A00",
+  "Asociado Preferente": "#E1062C",
+};
+
+function EstatusBadge({ estatus }) {
+  const color = ESTATUS_COLORS[estatus] || "#888";
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        padding: "3px 10px",
+        borderRadius: 20,
+        fontSize: 11,
+        fontWeight: 800,
+        color: color,
+        background: `${color}1A`,
+        border: `1px solid ${color}55`,
+        letterSpacing: 0.3,
+      }}
+    >
+      {estatus}
+    </span>
+  );
+}
+
+function PersonasScreen({ onSelectPersona, onNuevoPerfil, onBack }) {
+  const [personas, setPersonas] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filtro, setFiltro] = useState("Todos");
+  const [busqueda, setBusqueda] = useState("");
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    cargarPersonas();
+  }, []);
+
+  async function cargarPersonas() {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await listarPersonas();
+      setPersonas(data);
+    } catch (e) {
+      setError("No se pudo conectar a la base de datos. Verifica tu conexión a internet.");
+    }
+    setLoading(false);
+  }
+
+  async function handleCambiarEstatus(persona, nuevoEstatus) {
+    try {
+      await actualizarEstatusPersona(persona.id, nuevoEstatus);
+      setPersonas((prev) =>
+        prev.map((p) => (p.id === persona.id ? { ...p, estatus: nuevoEstatus } : p))
+      );
+    } catch (e) {
+      alert("No se pudo actualizar el estatus. Intenta de nuevo.");
+    }
+  }
+
+  const personasFiltradas = personas.filter((p) => {
+    const pasaEstatus = filtro === "Todos" || p.estatus === filtro;
+    const pasaBusqueda = p.nombre.toLowerCase().includes(busqueda.toLowerCase());
+    return pasaEstatus && pasaBusqueda;
+  });
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#050505", fontFamily: "'Helvetica Neue', Arial, sans-serif", padding: "20px 16px 80px" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <button onClick={onBack} style={{ background: "none", border: "none", color: "#00C8FF", fontSize: 13, cursor: "pointer", padding: 0 }}>
+            ← Inicio
+          </button>
+          <button
+            onClick={onNuevoPerfil}
+            style={{ background: "#00C8FF", border: "none", color: "#000", fontSize: 13, fontWeight: 800, cursor: "pointer", padding: "8px 14px", borderRadius: 10 }}
+          >
+            + Nuevo Perfil
+          </button>
+        </div>
+
+        <h2 style={{ color: "#fff", fontSize: 20, fontWeight: 800, marginBottom: 14 }}>Mis Personas</h2>
+
+        <input
+          placeholder="Buscar por nombre..."
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value)}
+          style={{ ...inputStyle(), marginBottom: 12 }}
+        />
+
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+          {["Todos", ...ESTATUS_OPTIONS].map((f) => (
+            <button
+              key={f}
+              onClick={() => setFiltro(f)}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 20,
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+                border: filtro === f ? "1px solid #00C8FF" : "1px solid #2a2a2a",
+                background: filtro === f ? "#00C8FF22" : "transparent",
+                color: filtro === f ? "#00C8FF" : "#999",
+              }}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+
+        {loading && <p style={{ color: "#888", fontSize: 13, textAlign: "center" }}>Cargando personas...</p>}
+        {error && <p style={{ color: "#E1062C", fontSize: 13, textAlign: "center" }}>{error}</p>}
+
+        {!loading && !error && personasFiltradas.length === 0 && (
+          <p style={{ color: "#666", fontSize: 13, textAlign: "center", marginTop: 30 }}>
+            {personas.length === 0
+              ? "Aún no tienes personas registradas. Crea tu primer perfil para empezar."
+              : "No hay personas que coincidan con este filtro."}
+          </p>
+        )}
+
+        {personasFiltradas.map((p) => (
+          <div
+            key={p.id}
+            style={{
+              background: "#0d0d0d",
+              border: "1px solid #1c1c1c",
+              borderRadius: 14,
+              padding: 14,
+              marginBottom: 10,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div onClick={() => onSelectPersona(p)} style={{ cursor: "pointer", flex: 1 }}>
+                <div style={{ color: "#fff", fontWeight: 800, fontSize: 16, marginBottom: 4 }}>{p.nombre}</div>
+                <EstatusBadge estatus={p.estatus} />
+              </div>
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <select
+                value={p.estatus}
+                onChange={(e) => handleCambiarEstatus(p, e.target.value)}
+                style={{
+                  width: "100%",
+                  background: "#151515",
+                  border: "1px solid #2a2a2a",
+                  borderRadius: 8,
+                  padding: "6px 8px",
+                  color: "#ccc",
+                  fontSize: 12,
+                }}
+              >
+                {ESTATUS_OPTIONS.map((o) => (
+                  <option key={o} value={o}>
+                    Cambiar a: {o}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+/* ====================================================================
+   PANTALLA DE INICIO — Seguimientos de Hoy
+   ==================================================================== */
+
+function HomeScreen({ onVerPersonas, onNuevoPerfil }) {
+  const [seguimientosHoy, setSeguimientosHoy] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    cargarSeguimientos();
+  }, []);
+
+  async function cargarSeguimientos() {
+    setLoading(true);
+    try {
+      const personas = await listarPersonas();
+      const resultados = [];
+      for (const persona of personas) {
+        const perfiles = await listarPerfilesDePersona(persona.id);
+        if (perfiles.length === 0) continue;
+        const ultimoPerfil = perfiles[perfiles.length - 1];
+        const dias = diasDesde(ultimoPerfil.fecha_evaluacion);
+        if (tocaSeguimientoHoy(dias)) {
+          resultados.push({ persona, dias, ultimoPerfil });
+        }
+      }
+      setSeguimientosHoy(resultados);
+    } catch (e) {
+      // silencioso, se muestra vacío
+    }
+    setLoading(false);
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#050505",
+        fontFamily: "'Helvetica Neue', Arial, sans-serif",
+        padding: "24px 16px 80px",
+      }}
+    >
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 24 }}>
+          <img src={`data:image/jpeg;base64,${LOGO_B64}`} alt="EVOLXIA" style={{ width: 46 }} />
+          <div>
+            <div style={{ color: "#fff", fontWeight: 900, fontSize: 18 }}>
+              EVOLXIA<span style={{ color: "#00C8FF" }}>®</span>
+            </div>
+            <div style={{ color: "#888", fontSize: 11 }}>Wellness Profile · Panel de Coach</div>
+          </div>
+        </div>
+
+        <h2 style={{ color: "#fff", fontSize: 20, fontWeight: 800, marginBottom: 4 }}>
+          Seguimientos de Hoy
+        </h2>
+        <p style={{ color: "#888", fontSize: 12.5, marginBottom: 18 }}>
+          {new Date().toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" })}
+        </p>
+
+        {loading && <p style={{ color: "#888", fontSize: 13, textAlign: "center" }}>Cargando...</p>}
+
+        {!loading && seguimientosHoy.length === 0 && (
+          <div
+            style={{
+              background: "#0d0d0d",
+              border: "1px solid #1c1c1c",
+              borderRadius: 14,
+              padding: 24,
+              textAlign: "center",
+              marginBottom: 20,
+            }}
+          >
+            <div style={{ fontSize: 30, marginBottom: 8 }}>✅</div>
+            <p style={{ color: "#aaa", fontSize: 13 }}>No tienes seguimientos pendientes para hoy.</p>
+          </div>
+        )}
+
+        {!loading &&
+          seguimientosHoy.map(({ persona, dias, ultimoPerfil }) => (
+            <div
+              key={persona.id}
+              style={{
+                background: "#0d0d0d",
+                border: "1px solid #00C8FF33",
+                borderRadius: 14,
+                padding: 14,
+                marginBottom: 10,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                <div>
+                  <div style={{ color: "#fff", fontWeight: 800, fontSize: 15 }}>{persona.nombre}</div>
+                  <EstatusBadge estatus={persona.estatus} />
+                </div>
+                <div style={{ color: "#00C8FF", fontSize: 12, fontWeight: 700, textAlign: "right" }}>
+                  Día {dias}
+                </div>
+              </div>
+              <FollowUpButtons persona={persona} diasTranscurridos={dias} compact />
+            </div>
+          ))}
+
+        <div style={{ height: 1, background: "#1c1c1c", margin: "26px 0 20px" }} />
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onVerPersonas} style={navButtonStyle("#00C8FF")}>
+            👥 Mis Personas
+          </button>
+          <button onClick={onNuevoPerfil} style={navButtonStyle("#8BFF00")}>
+            + Nuevo Perfil
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function navButtonStyle(color) {
+  return {
+    flex: 1,
+    background: "#0d0d0d",
+    border: `1px solid ${color}44`,
+    borderRadius: 12,
+    padding: "14px 10px",
+    color: "#fff",
+    fontWeight: 700,
+    fontSize: 13,
+    cursor: "pointer",
+  };
+}
+
+/* ====================================================================
+   BOTONES DE SEGUIMIENTO — WhatsApp / Email / SMS
+   ==================================================================== */
+
+function FollowUpButtons({ persona, diasTranscurridos, programaLabel, compact }) {
+  const mensaje = mensajeSeguimiento({
+    nombre: persona.nombre,
+    diasTranscurridos,
+    coach: persona.coach || "tu coach EVOLXIA®",
+    programaLabel,
+  });
+
+  const btnStyle = {
+    flex: 1,
+    padding: compact ? "8px 6px" : "12px 8px",
+    borderRadius: 10,
+    border: "none",
+    fontWeight: 700,
+    fontSize: compact ? 11 : 13,
+    cursor: "pointer",
+    color: "#000",
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 6 }}>
+      {persona.whatsapp && (
+        <button onClick={() => abrirWhatsApp(persona.whatsapp, mensaje)} style={{ ...btnStyle, background: "#25D366" }}>
+          WhatsApp
+        </button>
+      )}
+      {persona.email && (
+        <button
+          onClick={() => abrirEmail(persona.email, "Seguimiento EVOLXIA® Wellness", mensaje)}
+          style={{ ...btnStyle, background: "#00C8FF" }}
+        >
+          Email
+        </button>
+      )}
+      {persona.telefono && (
+        <button onClick={() => abrirSMS(persona.telefono, mensaje)} style={{ ...btnStyle, background: "#F3F3F3" }}>
+          SMS
+        </button>
+      )}
+      {!persona.whatsapp && !persona.email && !persona.telefono && (
+        <p style={{ color: "#666", fontSize: 11, margin: 0 }}>
+          Agrega WhatsApp, email o teléfono a esta persona para poder contactarla.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ====================================================================
+   DETALLE DE PERSONA — historial + evolución + programa + seguimiento
+   ==================================================================== */
+
+function PersonaDetailScreen({ persona, onBack, onNuevoPerfil }) {
+  const [perfiles, setPerfiles] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    cargarHistorial();
+  }, [persona.id]);
+
+  async function cargarHistorial() {
+    setLoading(true);
+    try {
+      const data = await listarPerfilesDePersona(persona.id);
+      setPerfiles(data);
+    } catch (e) {
+      // noop
+    }
+    setLoading(false);
+  }
+
+  const ultimoPerfil = perfiles.length > 0 ? perfiles[perfiles.length - 1] : null;
+  const dias = ultimoPerfil ? diasDesde(ultimoPerfil.fecha_evaluacion) : null;
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#050505", fontFamily: "'Helvetica Neue', Arial, sans-serif", padding: "20px 16px 80px" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "#00C8FF", fontSize: 13, marginBottom: 16, cursor: "pointer", padding: 0 }}>
+          ← Mis Personas
+        </button>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18 }}>
+          <div>
+            <h2 style={{ color: "#fff", fontSize: 22, fontWeight: 800, margin: 0 }}>{persona.nombre}</h2>
+            <div style={{ marginTop: 6 }}>
+              <EstatusBadge estatus={persona.estatus} />
+            </div>
+          </div>
+          <button
+            onClick={() => onNuevoPerfil(persona)}
+            style={{ background: "#00C8FF", border: "none", color: "#000", fontSize: 12, fontWeight: 800, cursor: "pointer", padding: "8px 12px", borderRadius: 10 }}
+          >
+            + Nuevo Perfil
+          </button>
+        </div>
+
+        {dias !== null && (
+          <div style={{ background: "#0d0d0d", border: "1px solid #1c1c1c", borderRadius: 14, padding: 14, marginBottom: 18 }}>
+            <div style={{ color: "#888", fontSize: 12, marginBottom: 8 }}>
+              Último perfil: {ultimoPerfil.fecha_evaluacion} · Día {dias} de seguimiento
+            </div>
+            <FollowUpButtons persona={persona} diasTranscurridos={dias} />
+          </div>
+        )}
+
+        {loading && <p style={{ color: "#888", fontSize: 13, textAlign: "center" }}>Cargando historial...</p>}
+
+        {!loading && perfiles.length === 0 && (
+          <p style={{ color: "#666", fontSize: 13, textAlign: "center", marginTop: 30 }}>
+            Esta persona aún no tiene perfiles de bienestar. Crea el primero.
+          </p>
+        )}
+
+        {!loading && perfiles.length > 0 && (
+          <>
+            <h3 style={{ color: "#00C8FF", fontSize: 14, fontWeight: 800, marginBottom: 10 }}>
+              HISTORIAL ({perfiles.length} perfil{perfiles.length > 1 ? "es" : ""})
+            </h3>
+            {perfiles
+              .slice()
+              .reverse()
+              .map((p, idx) => (
+                <div key={p.id} style={{ background: "#0d0d0d", border: "1px solid #1c1c1c", borderRadius: 12, padding: 12, marginBottom: 8 }}>
+                  <div style={{ color: "#fff", fontWeight: 700, fontSize: 14 }}>{formatDate(p.fecha_evaluacion)}</div>
+                  <div style={{ color: "#888", fontSize: 12, marginTop: 4 }}>
+                    Peso: {p.peso ?? "—"} lb · BMI: {p.bmi ?? "—"} · % Grasa: {p.bfr ?? "—"}%
+                  </div>
+                </div>
+              ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatDate(dateStr) {
+  if (!dateStr) return "—";
+  const d = new Date(dateStr);
+  return d.toLocaleDateString("es-ES", { day: "2-digit", month: "long", year: "numeric" });
+}
+
+
 const initialForm = {
   nombre: "",
   fechaNacimiento: "",
@@ -717,9 +1332,12 @@ function FormScreen({ mode, form, update, onBack, onSubmit, canSubmit }) {
   );
 }
 
-function ReportScreen({ form, onEdit, onRestart }) {
+function ReportScreen({ form, persona, historialPrevio, onEdit, onRestart, onVerPersona }) {
   const canvasRef = useRef(null);
   const [logoImg, setLogoImg] = useState(null);
+  const [guardado, setGuardado] = useState(false);
+  const [guardando, setGuardando] = useState(true);
+  const [errorGuardado, setErrorGuardado] = useState(null);
   const edad = calcAge(form.fechaNacimiento, form.fechaEvaluacion);
 
   useEffect(() => {
@@ -729,20 +1347,62 @@ function ReportScreen({ form, onEdit, onRestart }) {
   }, []);
 
   useEffect(() => {
-    if (logoImg) draw();
+    guardarEnSupabase();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [logoImg]);
+  }, []);
+
+  useEffect(() => {
+    if (logoImg && guardado) draw();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logoImg, guardado]);
+
+  async function guardarEnSupabase() {
+    setGuardando(true);
+    try {
+      if (persona && persona.id) {
+        await guardarPerfil(persona.id, form);
+      }
+    } catch (e) {
+      setErrorGuardado("No se pudo guardar este perfil en tu historial (revisa tu conexión). El reporte se generará igual.");
+    }
+    setGuardando(false);
+    setGuardado(true);
+  }
 
   function num(key) {
     const v = parseFloat(form[key]);
     return isNaN(v) ? null : v;
   }
 
+  // Convertir historial previo (filas de Supabase, snake_case) a shape camelCase para comparar
+  const historialForms = (historialPrevio || []).map((row) => perfilRowToForm(row, persona));
+  const perfilAnterior = historialForms.length > 0 ? historialForms[historialForms.length - 1] : null;
+  const tieneEvolucion = perfilAnterior !== null;
+  const cambiosEvolucion = tieneEvolucion ? compararPerfiles(form, perfilAnterior) : [];
+
+  // Programa de transformación recomendado
+  const pesoLb = num("peso");
+  const piesValProg = num("alturaPies");
+  const pulgValProg = num("alturaPulgadas") || 0;
+  const heightInTotalProg = piesValProg !== null ? piesValProg * 12 + pulgValProg : null;
+  const bfrValProg = num("bfr");
+  let programa = null;
+  if (pesoLb !== null && heightInTotalProg !== null && bfrValProg !== null && edad !== null) {
+    const idealW = calcIdealWeight(heightInTotalProg, form.sexo);
+    const idealFatMid = idealBodyFatMid(form.sexo, edad);
+    programa = calcularProgramaRecomendado({
+      pesoLb,
+      idealWeightLb: idealW,
+      bfrPct: bfrValProg,
+      idealFatMidPct: idealFatMid,
+    });
+  }
+
   function draw() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const W = 1080;
-    const H = 2600;
+    const H = 4400;
     canvas.width = W;
     canvas.height = H;
     const ctx = canvas.getContext("2d");
@@ -758,68 +1418,68 @@ function ReportScreen({ form, onEdit, onRestart }) {
       ctx.restore();
     }
 
-    let y = 56;
+    let y = 64;
 
     if (logoImg) {
-      const logoW = 70;
+      const logoW = 80;
       const logoH = logoW * (logoImg.height / logoImg.width);
       ctx.drawImage(logoImg, 40, y - 10, logoW, logoH);
     }
     ctx.textAlign = "right";
     ctx.fillStyle = COLORS.white;
-    ctx.font = "900 30px Arial";
-    ctx.fillText("EVOLXIA® WELLNESS PROFILE™", W - 40, y + 14);
-    ctx.font = "500 16px Arial";
+    ctx.font = "900 38px Arial";
+    ctx.fillText("EVOLXIA® WELLNESS PROFILE™", W - 40, y + 16);
+    ctx.font = "500 20px Arial";
     ctx.fillStyle = COLORS.gray;
     ctx.globalAlpha = 0.7;
-    ctx.fillText("Perfil Integral de Bienestar, Composición y Longevidad", W - 40, y + 40);
+    ctx.fillText("Perfil Integral de Bienestar, Composición y Longevidad", W - 40, y + 46);
     ctx.globalAlpha = 1;
-    ctx.font = "500 14px Arial";
+    ctx.font = "600 18px Arial";
     ctx.fillStyle = COLORS.blue;
-    ctx.fillText(`Evaluación: ${formatDate(form.fechaEvaluacion)}`, W - 40, y + 64);
+    ctx.fillText(`Evaluación: ${formatDate(form.fechaEvaluacion)}`, W - 40, y + 74);
 
-    y += 100;
+    y += 116;
     ctx.textAlign = "left";
 
-    roundRect(ctx, 40, y, W - 80, 84, 18);
+    roundRect(ctx, 40, y, W - 80, 100, 18);
     ctx.fillStyle = COLORS.panel;
     ctx.fill();
     ctx.strokeStyle = "#1f1f1f";
     ctx.lineWidth = 1;
     ctx.stroke();
     ctx.fillStyle = COLORS.white;
-    ctx.font = "800 26px Arial";
-    ctx.fillText(form.nombre || "—", 64, y + 36);
-    ctx.font = "500 14px Arial";
+    ctx.font = "800 34px Arial";
+    ctx.fillText(form.nombre || "—", 64, y + 42);
+    ctx.font = "500 18px Arial";
     ctx.fillStyle = COLORS.gray;
     ctx.globalAlpha = 0.7;
-    ctx.fillText(`${edad ?? "—"} años · ${form.sexo === "M" ? "Masculino" : "Femenino"} · Objetivo: ${form.objetivo || "General"}`, 64, y + 62);
+    ctx.fillText(`${edad ?? "—"} años · ${form.sexo === "M" ? "Masculino" : "Femenino"} · Objetivo: ${form.objetivo || "General"}`, 64, y + 74);
     ctx.globalAlpha = 1;
-    y += 84 + 30;
+    y += 100 + 32;
 
     // Edad metabólica vs cronológica (si fue ingresada)
     const edadMeta = num("edadMetabolica");
     if (edadMeta !== null && edad !== null) {
       sectionLabel(ctx, "EDAD CRONOLÓGICA VS. EDAD METABÓLICA", 40, y);
-      y += 30;
-      panelBg(ctx, 40, y, W - 80, 150);
+      y += 36;
+      panelBg(ctx, 40, y, W - 80, 190);
       const maxAge = Math.max(edad, edadMeta) + 10;
-      const barAreaX = 180;
+      const barAreaX = 220;
       const barAreaW = W - 80 - barAreaX - 60;
-      drawAgeBar(ctx, barAreaX, y + 38, barAreaW, edad, maxAge, COLORS.blue, "Cronológica", edad);
-      drawAgeBar(ctx, barAreaX, y + 96, barAreaW, edadMeta, maxAge, COLORS.orange, "Metabólica", edadMeta);
-      y += 150 + 16;
+      drawAgeBar(ctx, barAreaX, y + 50, barAreaW, edad, maxAge, COLORS.blue, "Cronológica", edad);
+      drawAgeBar(ctx, barAreaX, y + 124, barAreaW, edadMeta, maxAge, COLORS.orange, "Metabólica", edadMeta);
+      y += 190 + 20;
 
       const msg =
         edadMeta > edad
           ? "Tu edad metabólica es superior a tu edad cronológica. Esto indica que tu organismo podría beneficiarse de mejoras en nutrición, actividad física, hidratación y composición corporal."
           : "Excelente. Tu edad metabólica refleja hábitos saludables y un buen estado de bienestar.";
-      ctx.font = "500 15px Arial";
+      ctx.font = "500 19px Arial";
       ctx.fillStyle = COLORS.gray;
       ctx.globalAlpha = 0.85;
-      const msgLines = wrapText(ctx, msg, 40, y, W - 80, 21);
+      const msgLines = wrapText(ctx, msg, 40, y, W - 80, 27);
       ctx.globalAlpha = 1;
-      y += msgLines * 21 + 28;
+      y += msgLines * 27 + 32;
     }
 
     // ---- Métricas con rango de referencia (barra + marcador) ----
@@ -843,25 +1503,46 @@ function ReportScreen({ form, onEdit, onRestart }) {
       if (val === null) return;
       const refDef = REF[m.refKey];
       const zone = classify(m.refKey, val, form.sexo);
-      const rowH = 112;
+      const zoneList = refDef.zones[form.sexo] || refDef.zones.F;
+      const rangeText = buildRangeText(zoneList, refDef.unit);
+
+      ctx.font = "500 15px Arial";
+      const rangeWidth = ctx.measureText(rangeText).width;
+      const availableWidth = W - 80 - 48;
+      const needsTwoLines = rangeWidth > availableWidth;
+      const rowH = needsTwoLines ? 178 : 156;
+
       panelBg(ctx, 40, y, W - 80, rowH);
 
       ctx.textAlign = "left";
-      ctx.font = "700 17px Arial";
+      ctx.font = "700 23px Arial";
       ctx.fillStyle = COLORS.white;
-      ctx.fillText(refDef.label, 64, y + 32);
+      ctx.fillText(refDef.label, 64, y + 38);
 
       ctx.textAlign = "right";
-      ctx.font = "800 20px Arial";
+      ctx.font = "800 27px Arial";
       ctx.fillStyle = zone ? zone.color : COLORS.white;
-      ctx.fillText(`${val}${refDef.unit}`, W - 64, y + 32);
-      ctx.font = "600 13px Arial";
-      ctx.globalAlpha = 0.85;
-      ctx.fillText(zone ? zone.label.toUpperCase() : "", W - 64, y + 50);
+      ctx.fillText(`${val}${refDef.unit}`, W - 64, y + 38);
+      ctx.font = "700 17px Arial";
+      ctx.globalAlpha = 0.9;
+      ctx.fillText(zone ? zone.label.toUpperCase() : "", W - 64, y + 62);
       ctx.globalAlpha = 1;
 
-      drawRangeBar(ctx, 64, y + 64, W - 80 - 48, 20, val, refDef, form.sexo);
-      y += rowH + 18;
+      drawRangeBar(ctx, 64, y + 82, availableWidth, 26, val, refDef, form.sexo);
+
+      // Rango de referencia textual debajo de la barra
+      ctx.textAlign = "left";
+      ctx.font = "500 15px Arial";
+      ctx.fillStyle = COLORS.gray;
+      ctx.globalAlpha = 0.6;
+      if (needsTwoLines) {
+        wrapText(ctx, rangeText, 64, y + 132, availableWidth, 20);
+      } else {
+        ctx.fillText(rangeText, 64, y + 134);
+      }
+      ctx.globalAlpha = 1;
+
+      y += rowH + 20;
     });
 
     y += 14;
@@ -870,65 +1551,65 @@ function ReportScreen({ form, onEdit, onRestart }) {
     const masaGrasa = num("masaGrasa");
     const masaMuscular = num("masaMuscular");
     if (masaGrasa !== null || masaMuscular !== null) {
-      sectionLabel(ctx, "COMPOSICIÓN EN KILOGRAMOS", 40, y);
-      y += 30;
-      panelBg(ctx, 40, y, W - 80, 110);
+      sectionLabel(ctx, "COMPOSICIÓN EN LIBRAS", 40, y);
+      y += 36;
+      panelBg(ctx, 40, y, W - 80, 140);
       const halfW = (W - 80 - 32) / 2;
       if (masaGrasa !== null) {
         ctx.textAlign = "left";
-        ctx.font = "600 13px Arial";
+        ctx.font = "700 17px Arial";
         ctx.fillStyle = COLORS.gray;
-        ctx.globalAlpha = 0.7;
-        ctx.fillText("MASA GRASA", 64, y + 36);
+        ctx.globalAlpha = 0.75;
+        ctx.fillText("MASA GRASA", 64, y + 42);
         ctx.globalAlpha = 1;
-        ctx.font = "800 30px Arial";
+        ctx.font = "800 38px Arial";
         ctx.fillStyle = COLORS.red;
-        ctx.fillText(`${masaGrasa} lb`, 64, y + 70);
+        ctx.fillText(`${masaGrasa} lb`, 64, y + 88);
       }
       if (masaMuscular !== null) {
         const x2 = 64 + halfW + 32;
         ctx.textAlign = "left";
-        ctx.font = "600 13px Arial";
+        ctx.font = "700 17px Arial";
         ctx.fillStyle = COLORS.gray;
-        ctx.globalAlpha = 0.7;
-        ctx.fillText("MASA MUSCULAR", x2, y + 36);
+        ctx.globalAlpha = 0.75;
+        ctx.fillText("MASA MUSCULAR", x2, y + 42);
         ctx.globalAlpha = 1;
-        ctx.font = "800 30px Arial";
+        ctx.font = "800 38px Arial";
         ctx.fillStyle = COLORS.green;
-        ctx.fillText(`${masaMuscular} lb`, x2, y + 70);
+        ctx.fillText(`${masaMuscular} lb`, x2, y + 88);
       }
-      y += 110 + 30;
+      y += 140 + 32;
     }
 
     // ---- Tipo de cuerpo / Nivel de obesidad (categóricos) ----
     sectionLabel(ctx, "CLASIFICACIÓN CORPORAL", 40, y);
-    y += 30;
-    panelBg(ctx, 40, y, W - 80, 130);
+    y += 36;
+    panelBg(ctx, 40, y, W - 80, 168);
     ctx.textAlign = "left";
-    ctx.font = "600 13px Arial";
+    ctx.font = "700 17px Arial";
     ctx.fillStyle = COLORS.gray;
-    ctx.globalAlpha = 0.7;
-    ctx.fillText("TIPO DE CUERPO", 64, y + 34);
+    ctx.globalAlpha = 0.75;
+    ctx.fillText("TIPO DE CUERPO", 64, y + 42);
     ctx.globalAlpha = 1;
-    ctx.font = "800 22px Arial";
+    ctx.font = "800 28px Arial";
     ctx.fillStyle = COLORS.blue;
-    ctx.fillText(form.tipoCuerpo, 64, y + 64);
+    ctx.fillText(form.tipoCuerpo, 64, y + 82);
 
-    ctx.font = "600 13px Arial";
+    ctx.font = "700 17px Arial";
     ctx.fillStyle = COLORS.gray;
-    ctx.globalAlpha = 0.7;
-    ctx.fillText("NIVEL DE OBESIDAD", 64, y + 96);
+    ctx.globalAlpha = 0.75;
+    ctx.fillText("NIVEL DE OBESIDAD", 64, y + 126);
     ctx.globalAlpha = 1;
     const obColor = form.nivelObesidad === "Normal" ? COLORS.green : form.nivelObesidad === "Bajo Peso" ? COLORS.blue : form.nivelObesidad === "Sobrepeso" ? COLORS.orange : COLORS.red;
-    ctx.font = "800 18px Arial";
+    ctx.font = "800 24px Arial";
     ctx.fillStyle = obColor;
     ctx.textAlign = "right";
-    ctx.fillText(form.nivelObesidad, W - 64, y + 96);
-    y += 130 + 30;
+    ctx.fillText(form.nivelObesidad, W - 64, y + 126);
+    y += 168 + 32;
 
     // ---- Peso a controlar / Relación de grasa a controlar ----
     sectionLabel(ctx, "OBJETIVOS DE CONTROL", 40, y);
-    y += 30;
+    y += 36;
     const pesoLb = num("peso");
     const piesVal = num("alturaPies");
     const pulgVal = num("alturaPulgadas") || 0;
@@ -939,51 +1620,157 @@ function ReportScreen({ form, onEdit, onRestart }) {
       const idealW = calcIdealWeight(heightInTotal, form.sexo);
       const pesoControlar = pesoLb - idealW;
 
-      panelBg(ctx, 40, y, W - 80, 110);
+      panelBg(ctx, 40, y, W - 80, 140);
       ctx.textAlign = "left";
-      ctx.font = "600 13px Arial";
+      ctx.font = "700 17px Arial";
       ctx.fillStyle = COLORS.gray;
-      ctx.globalAlpha = 0.7;
-      ctx.fillText("PESO A CONTROLAR (vs. peso ideal por altura)", 64, y + 32);
+      ctx.globalAlpha = 0.75;
+      ctx.fillText("PESO A CONTROLAR (vs. peso ideal por altura)", 64, y + 38);
       ctx.globalAlpha = 1;
-      ctx.font = "800 30px Arial";
+      ctx.font = "800 38px Arial";
       ctx.fillStyle = pesoControlar > 0 ? COLORS.orange : COLORS.blue;
       const sign = pesoControlar > 0 ? "-" : "+";
-      ctx.fillText(`${sign}${Math.abs(pesoControlar).toFixed(1)} lb`, 64, y + 68);
-      ctx.font = "500 13px Arial";
+      ctx.fillText(`${sign}${Math.abs(pesoControlar).toFixed(1)} lb`, 64, y + 84);
+      ctx.font = "500 16px Arial";
       ctx.fillStyle = COLORS.gray;
       ctx.globalAlpha = 0.65;
-      ctx.fillText(`Peso ideal estimado: ${idealW.toFixed(1)} lb`, 64, y + 92);
+      ctx.fillText(`Peso ideal estimado: ${idealW.toFixed(1)} lb`, 64, y + 116);
       ctx.globalAlpha = 1;
-      y += 110 + 18;
+      y += 140 + 22;
     }
 
     if (bfrVal !== null && edad !== null) {
       const idealFatMid = idealBodyFatMid(form.sexo, edad);
       const grasaControlar = bfrVal - idealFatMid;
 
-      panelBg(ctx, 40, y, W - 80, 110);
+      panelBg(ctx, 40, y, W - 80, 140);
       ctx.textAlign = "left";
-      ctx.font = "600 13px Arial";
+      ctx.font = "700 17px Arial";
       ctx.fillStyle = COLORS.gray;
-      ctx.globalAlpha = 0.7;
-      ctx.fillText("RELACIÓN DE GRASA A CONTROLAR (vs. rango ideal por edad)", 64, y + 32);
+      ctx.globalAlpha = 0.75;
+      ctx.fillText("RELACIÓN DE GRASA A CONTROLAR (vs. rango ideal por edad)", 64, y + 38);
       ctx.globalAlpha = 1;
-      ctx.font = "800 30px Arial";
+      ctx.font = "800 38px Arial";
       ctx.fillStyle = grasaControlar > 0 ? COLORS.orange : COLORS.blue;
       const sign2 = grasaControlar > 0 ? "-" : "+";
-      ctx.fillText(`${sign2}${Math.abs(grasaControlar).toFixed(1)} %`, 64, y + 68);
-      ctx.font = "500 13px Arial";
+      ctx.fillText(`${sign2}${Math.abs(grasaControlar).toFixed(1)} %`, 64, y + 84);
+      ctx.font = "500 16px Arial";
       ctx.fillStyle = COLORS.gray;
       ctx.globalAlpha = 0.65;
-      ctx.fillText(`% Grasa ideal de referencia para tu edad: ${idealFatMid}%`, 64, y + 92);
+      ctx.fillText(`% Grasa ideal de referencia para tu edad: ${idealFatMid}%`, 64, y + 116);
       ctx.globalAlpha = 1;
-      y += 110 + 30;
+      y += 140 + 32;
+    }
+
+    // ---- PROGRAMA DE TRANSFORMACIÓN RECOMENDADO ----
+    if (programa) {
+      sectionLabel(ctx, "PROPUESTA · PROGRAMA DE TRANSFORMACIÓN", 40, y);
+      y += 36;
+      const progH = 230;
+      panelBg(ctx, 40, y, W - 80, progH);
+
+      ctx.textAlign = "left";
+      ctx.font = "700 17px Arial";
+      ctx.fillStyle = COLORS.gray;
+      ctx.globalAlpha = 0.75;
+      ctx.fillText("PROGRAMA RECOMENDADO", 64, y + 38);
+      ctx.globalAlpha = 1;
+      ctx.font = "900 40px Arial";
+      ctx.fillStyle = COLORS.green;
+      ctx.fillText(programa.programaLabel, 64, y + 88);
+
+      ctx.font = "500 17px Arial";
+      ctx.fillStyle = COLORS.gray;
+      ctx.globalAlpha = 0.85;
+      ctx.fillText(`Libras a perder vs. tu peso de referencia: ${programa.librasAPerder} lb`, 64, y + 128);
+      ctx.fillText(`Puntos de % grasa a controlar: ${programa.puntosGrasaAPerder}%`, 64, y + 154);
+      ctx.fillText(`Tiempo estimado para lograrlo: ~${programa.semanasEstimadas} semanas (${programa.diasEstimados} días)`, 64, y + 180);
+      ctx.globalAlpha = 1;
+      ctx.font = "500 14px Arial";
+      ctx.fillStyle = COLORS.gray;
+      ctx.globalAlpha = 0.55;
+      ctx.fillText("* Estimación orientativa, no es un diagnóstico médico.", 64, y + 210);
+      ctx.globalAlpha = 1;
+
+      y += progH + 32;
+    }
+
+    // ---- EVOLUCIÓN (solo si hay 2+ perfiles) ----
+    if (tieneEvolucion) {
+      sectionLabel(ctx, "TU EVOLUCIÓN · COMPARADO CON TU PERFIL ANTERIOR", 40, y);
+      y += 36;
+      ctx.font = "500 16px Arial";
+      ctx.fillStyle = COLORS.gray;
+      ctx.globalAlpha = 0.65;
+      ctx.fillText(`Perfil anterior: ${formatDate(perfilAnterior.fechaEvaluacion)}`, 40, y);
+      ctx.globalAlpha = 1;
+      y += 26;
+
+      // Mini gráficas de tendencia para los 3 valores más importantes
+      const trendFields = [
+        { key: "peso", label: "Peso (lb)", color: COLORS.blue },
+        { key: "bfr", label: "% Grasa Corporal", color: COLORS.orange },
+        { key: "edadMetabolica", label: "Edad Metabólica", color: COLORS.green },
+      ];
+      const allProfiles = [...historialForms, form];
+      const trendH = 200;
+      trendFields.forEach((tf) => {
+        const series = buildTrendSeries(allProfiles, tf.key);
+        if (series.length < 2) return;
+        panelBg(ctx, 40, y, W - 80, trendH);
+        ctx.textAlign = "left";
+        ctx.font = "700 17px Arial";
+        ctx.fillStyle = COLORS.white;
+        ctx.globalAlpha = 0.9;
+        ctx.fillText(tf.label, 64, y + 32);
+        ctx.globalAlpha = 1;
+        drawTrendLine(ctx, 64, y + 50, W - 80 - 48, 110, series, tf.color);
+        y += trendH + 18;
+      });
+
+      y += 10;
+
+      // Tabla comparativa de todos los valores
+      panelBg(ctx, 40, y, W - 80, 60 + cambiosEvolucion.length * 56);
+      ctx.textAlign = "left";
+      ctx.font = "700 16px Arial";
+      ctx.fillStyle = COLORS.gray;
+      ctx.globalAlpha = 0.6;
+      ctx.fillText("MÉTRICA", 64, y + 36);
+      ctx.textAlign = "right";
+      ctx.fillText("CAMBIO", W - 64, y + 36);
+      ctx.globalAlpha = 1;
+
+      let rowY = y + 70;
+      cambiosEvolucion.forEach((c) => {
+        ctx.textAlign = "left";
+        ctx.font = "600 18px Arial";
+        ctx.fillStyle = COLORS.white;
+        ctx.fillText(c.label, 64, rowY);
+
+        let arrow = "→";
+        let color = COLORS.gray;
+        if (c.direction === "up") {
+          arrow = "▲";
+          color = c.isGood === null ? COLORS.blue : c.isGood ? COLORS.green : COLORS.red;
+        } else if (c.direction === "down") {
+          arrow = "▼";
+          color = c.isGood === null ? COLORS.blue : c.isGood ? COLORS.green : COLORS.red;
+        }
+        ctx.textAlign = "right";
+        ctx.font = "800 18px Arial";
+        ctx.fillStyle = color;
+        const diffText = c.diff === 0 ? "Sin cambio" : `${arrow} ${Math.abs(c.diff).toFixed(1)}${c.unit}`;
+        ctx.fillText(diffText, W - 64, rowY);
+        rowY += 56;
+      });
+
+      y += 60 + cambiosEvolucion.length * 56 + 32;
     }
 
     // ---- AI Recommendations ----
     sectionLabel(ctx, "RECOMENDACIONES PERSONALIZADAS · EVOLXIA AI™", 40, y);
-    y += 30;
+    y += 36;
     const recs = generateRecommendations({
       bmi: num("bmi"),
       bfr: num("bfr"),
@@ -991,35 +1778,35 @@ function ReportScreen({ form, onEdit, onRestart }) {
       bodyWater: num("bodyWater"),
       sexo: form.sexo,
     });
-    const recH = 360;
+    const recH = 460;
     panelBg(ctx, 40, y, W - 80, recH);
     const recColW = (W - 80 - 64) / 2;
     recs.forEach((rec, i) => {
       const col = i % 2;
       const row = Math.floor(i / 2);
       const rx = 64 + col * (recColW + 32);
-      const ry = y + 34 + row * 84;
+      const ry = y + 42 + row * 106;
       ctx.fillStyle = COLORS.blue;
-      ctx.font = "800 13px Arial";
+      ctx.font = "800 17px Arial";
       ctx.textAlign = "left";
       ctx.fillText(rec.cat.toUpperCase(), rx, ry);
-      ctx.font = "500 14px Arial";
+      ctx.font = "500 18px Arial";
       ctx.fillStyle = COLORS.gray;
       ctx.globalAlpha = 0.9;
-      wrapText(ctx, rec.text, rx, ry + 22, recColW - 10, 18);
+      wrapText(ctx, rec.text, rx, ry + 28, recColW - 10, 23);
       ctx.globalAlpha = 1;
     });
     y += recH + 36;
 
     // ---- Disclaimer ----
-    ctx.font = "500 13px Arial";
+    ctx.font = "500 16px Arial";
     ctx.fillStyle = COLORS.orange;
     ctx.globalAlpha = 0.9;
     const disclaimer =
       "⚠️ Este estudio de composición corporal no debe considerarse información médica bajo ninguna circunstancia. Recomendamos consultar a un nutricionista profesional para la interpretación y análisis del estudio.";
-    const dLines = wrapText(ctx, disclaimer, 40, y, W - 80, 18);
+    const dLines = wrapText(ctx, disclaimer, 40, y, W - 80, 22);
     ctx.globalAlpha = 1;
-    y += dLines * 18 + 30;
+    y += dLines * 22 + 36;
 
     // ---- Footer ----
     ctx.strokeStyle = "#1c1c1c";
@@ -1027,34 +1814,34 @@ function ReportScreen({ form, onEdit, onRestart }) {
     ctx.moveTo(40, y);
     ctx.lineTo(W - 40, y);
     ctx.stroke();
-    y += 30;
+    y += 36;
 
     if (logoImg) {
-      const fLogoW = 50;
+      const fLogoW = 60;
       const fLogoH = fLogoW * (logoImg.height / logoImg.width);
       ctx.drawImage(logoImg, 40, y, fLogoW, fLogoH);
     }
     ctx.textAlign = "left";
-    ctx.font = "800 16px Arial";
+    ctx.font = "800 20px Arial";
     ctx.fillStyle = COLORS.white;
-    ctx.fillText(form.coach || "EVOLXIA® Coach", 104, y + 18);
-    ctx.font = "500 13px Arial";
+    ctx.fillText(form.coach || "EVOLXIA® Coach", 114, y + 22);
+    ctx.font = "500 16px Arial";
     ctx.fillStyle = COLORS.gray;
     ctx.globalAlpha = 0.75;
-    ctx.fillText(`WhatsApp: ${form.whatsapp}   ·   Instagram: ${form.instagram}`, 104, y + 38);
+    ctx.fillText(`WhatsApp: ${form.whatsapp}   ·   Instagram: ${form.instagram}`, 114, y + 46);
     ctx.globalAlpha = 1;
 
     ctx.textAlign = "right";
-    ctx.font = "800 14px Arial";
+    ctx.font = "800 18px Arial";
     ctx.fillStyle = COLORS.blue;
-    ctx.fillText("EVOLXIA®", W - 40, y + 18);
-    ctx.font = "500 12px Arial";
+    ctx.fillText("EVOLXIA®", W - 40, y + 22);
+    ctx.font = "500 15px Arial";
     ctx.fillStyle = COLORS.gray;
     ctx.globalAlpha = 0.7;
-    ctx.fillText("Longevidad · Bienestar · Estilo de Vida", W - 40, y + 36);
+    ctx.fillText("Longevidad · Bienestar · Estilo de Vida", W - 40, y + 44);
     ctx.globalAlpha = 1;
 
-    y += 70;
+    y += 80;
 
     // Trim canvas to actual content height for a clean export
     const finalH = Math.ceil(y / 20) * 20 + 20;
@@ -1111,9 +1898,21 @@ function ReportScreen({ form, onEdit, onRestart }) {
             ← Editar datos
           </button>
           <button onClick={onRestart} style={{ background: "none", border: "none", color: "#888", fontSize: 13, cursor: "pointer", padding: 0 }}>
-            Nuevo perfil
+            Inicio
           </button>
         </div>
+
+        {guardando && (
+          <p style={{ color: "#888", fontSize: 12, textAlign: "center", marginBottom: 10 }}>Guardando en el historial...</p>
+        )}
+        {errorGuardado && (
+          <p style={{ color: "#FF8A00", fontSize: 12, textAlign: "center", marginBottom: 10 }}>{errorGuardado}</p>
+        )}
+        {guardado && !errorGuardado && persona && (
+          <p style={{ color: "#8BFF00", fontSize: 12, textAlign: "center", marginBottom: 10 }}>
+            ✓ Guardado en el historial de {persona.nombre}
+          </p>
+        )}
 
         <div
           style={{
@@ -1144,6 +1943,25 @@ function ReportScreen({ form, onEdit, onRestart }) {
         >
           Compartir por WhatsApp / Stories
         </button>
+        {persona && onVerPersona && (
+          <button
+            onClick={() => onVerPersona(persona)}
+            style={{
+              width: "100%",
+              marginTop: 10,
+              padding: "12px",
+              background: "transparent",
+              color: "#8BFF00",
+              border: "1px solid #8BFF0055",
+              borderRadius: 12,
+              fontWeight: 700,
+              fontSize: 13,
+              cursor: "pointer",
+            }}
+          >
+            Ver historial completo de {persona.nombre}
+          </button>
+        )}
         <button
           onClick={downloadPng}
           style={{
@@ -1169,15 +1987,10 @@ function ReportScreen({ form, onEdit, onRestart }) {
   );
 }
 
-function formatDate(dateStr) {
-  if (!dateStr) return "—";
-  const d = new Date(dateStr);
-  return d.toLocaleDateString("es-ES", { day: "2-digit", month: "long", year: "numeric" });
-}
 
 function sectionLabel(ctx, text, x, y) {
   ctx.textAlign = "left";
-  ctx.font = "800 14px Arial";
+  ctx.font = "800 19px Arial";
   ctx.fillStyle = COLORS.blue;
   ctx.globalAlpha = 0.9;
   ctx.fillText(text, x, y);
@@ -1195,16 +2008,72 @@ function panelBg(ctx, x, y, w, h) {
 
 function drawAgeBar(ctx, x, y, w, value, max, color, label, displayVal) {
   ctx.textAlign = "left";
-  ctx.font = "600 14px Arial";
+  ctx.font = "700 18px Arial";
   ctx.fillStyle = COLORS.gray;
-  ctx.globalAlpha = 0.8;
-  ctx.fillText(label.toUpperCase(), x, y - 8);
+  ctx.globalAlpha = 0.85;
+  ctx.fillText(label.toUpperCase(), x, y - 10);
   ctx.globalAlpha = 1;
-  drawHBar(ctx, x, y, w, 22, (value / max) * 100, color);
+  drawHBar(ctx, x, y, w, 28, (value / max) * 100, color);
   ctx.textAlign = "right";
-  ctx.font = "800 16px Arial";
+  ctx.font = "800 22px Arial";
   ctx.fillStyle = COLORS.white;
-  ctx.fillText(`${displayVal} años`, x + w + 0, y + 17);
+  ctx.fillText(`${displayVal} años`, x + w + 0, y + 21);
+}
+
+function buildRangeText(zoneList, unit) {
+  let prevBound = null;
+  const parts = zoneList.map((z, i) => {
+    let rangeStr;
+    if (i === 0) {
+      rangeStr = `<${z.max}${unit}`;
+    } else if (z.max >= 99) {
+      rangeStr = `${prevBound}+${unit}`;
+    } else {
+      rangeStr = `${prevBound}–${z.max}${unit}`;
+    }
+    prevBound = z.max;
+    return `${z.label} ${rangeStr}`;
+  });
+  return parts.join("   ·   ");
+}
+
+function drawTrendLine(ctx, x, y, w, h, series, color) {
+  const values = series.map((s) => s.valor);
+  const minV = Math.min(...values);
+  const maxV = Math.max(...values);
+  const range = maxV - minV || 1;
+  const padding = 10;
+
+  const points = series.map((s, i) => {
+    const px = x + (i / (series.length - 1)) * w;
+    const py = y + h - padding - ((s.valor - minV) / range) * (h - padding * 2);
+    return { px, py, valor: s.valor };
+  });
+
+  // línea
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    if (i === 0) ctx.moveTo(p.px, p.py);
+    else ctx.lineTo(p.px, p.py);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 4;
+  ctx.lineJoin = "round";
+  ctx.stroke();
+
+  // puntos + valores
+  points.forEach((p, i) => {
+    ctx.beginPath();
+    ctx.arc(p.px, p.py, 6, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    ctx.textAlign = "center";
+    ctx.font = "700 14px Arial";
+    ctx.fillStyle = COLORS.white;
+    const labelY = p.py < y + h / 2 ? p.py + 24 : p.py - 16;
+    ctx.fillText(p.valor.toString(), p.px, labelY);
+  });
 }
 
 function drawRangeBar(ctx, x, y, w, h, value, refDef, sexo) {
@@ -1247,32 +2116,268 @@ function drawRangeBar(ctx, x, y, w, h, value, refDef, sexo) {
   ctx.stroke();
 }
 
+function NuevaPersonaScreen({ onCreada, onBack }) {
+  const [nombre, setNombre] = useState("");
+  const [fechaNacimiento, setFechaNacimiento] = useState("");
+  const [sexo, setSexo] = useState("F");
+  const [estatus, setEstatus] = useState("Prospecto");
+  const [whatsapp, setWhatsapp] = useState("");
+  const [email, setEmail] = useState("");
+  const [telefono, setTelefono] = useState("");
+  const [creando, setCreando] = useState(false);
+  const [error, setError] = useState(null);
+
+  const canCreate = nombre.trim().length > 0;
+
+  async function handleCreate() {
+    if (!canCreate) return;
+    setCreando(true);
+    setError(null);
+    try {
+      const persona = await crearPersona({ nombre, fechaNacimiento, sexo, estatus, whatsapp, email, telefono });
+      onCreada(persona);
+    } catch (e) {
+      setError("No se pudo crear la persona. Verifica tu conexión a internet e intenta de nuevo.");
+    }
+    setCreando(false);
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#050505", fontFamily: "'Helvetica Neue', Arial, sans-serif", padding: "24px 16px 80px" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "#00C8FF", fontSize: 13, marginBottom: 16, cursor: "pointer", padding: 0 }}>
+          ← Volver
+        </button>
+        <h2 style={{ color: "#fff", fontSize: 19, fontWeight: 800, marginBottom: 4 }}>Nueva Persona</h2>
+        <p style={{ color: "#888", fontSize: 12.5, marginBottom: 20 }}>
+          Registra a esta persona antes de generar su perfil de bienestar.
+        </p>
+
+        <Field label="Nombre Completo *">
+          <input style={inputStyle()} value={nombre} onChange={(e) => setNombre(e.target.value)} placeholder="Nombre y apellido" />
+        </Field>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <Field label="Fecha de Nacimiento">
+              <input type="date" style={inputStyle()} value={fechaNacimiento} onChange={(e) => setFechaNacimiento(e.target.value)} />
+            </Field>
+          </div>
+          <div style={{ width: 110 }}>
+            <Field label="Sexo">
+              <select style={inputStyle()} value={sexo} onChange={(e) => setSexo(e.target.value)}>
+                <option value="F">Femenino</option>
+                <option value="M">Masculino</option>
+              </select>
+            </Field>
+          </div>
+        </div>
+
+        <Field label="Estatus">
+          <select style={inputStyle()} value={estatus} onChange={(e) => setEstatus(e.target.value)}>
+            {ESTATUS_OPTIONS.map((o) => (
+              <option key={o} value={o}>{o}</option>
+            ))}
+          </select>
+        </Field>
+
+        <div style={{ height: 1, background: "#1c1c1c", margin: "18px 0 14px" }} />
+        <div style={{ color: "#00C8FF", fontWeight: 800, fontSize: 12, letterSpacing: 0.5, marginBottom: 10 }}>
+          DATOS DE CONTACTO (para seguimiento)
+        </div>
+
+        <Field label="WhatsApp">
+          <input style={inputStyle()} value={whatsapp} onChange={(e) => setWhatsapp(e.target.value)} placeholder="+1 786 000 0000" />
+        </Field>
+        <Field label="Email">
+          <input style={inputStyle()} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="correo@ejemplo.com" />
+        </Field>
+        <Field label="Teléfono (SMS)">
+          <input style={inputStyle()} value={telefono} onChange={(e) => setTelefono(e.target.value)} placeholder="+1 786 000 0000" />
+        </Field>
+
+        {error && <p style={{ color: "#E1062C", fontSize: 12, marginTop: 10 }}>{error}</p>}
+
+        <button
+          onClick={handleCreate}
+          disabled={!canCreate || creando}
+          style={{
+            width: "100%",
+            marginTop: 20,
+            padding: "14px",
+            background: canCreate ? "#00C8FF" : "#222",
+            color: canCreate ? "#000" : "#666",
+            border: "none",
+            borderRadius: 12,
+            fontWeight: 800,
+            fontSize: 14,
+            cursor: canCreate ? "pointer" : "not-allowed",
+          }}
+        >
+          {creando ? "Creando..." : "Crear y Continuar"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SeleccionarPersonaScreen({ onSelect, onCrearNueva, onBack }) {
+  const [personas, setPersonas] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busqueda, setBusqueda] = useState("");
+
+  useEffect(() => {
+    listarPersonas()
+      .then(setPersonas)
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  const filtradas = personas.filter((p) => p.nombre.toLowerCase().includes(busqueda.toLowerCase()));
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#050505", fontFamily: "'Helvetica Neue', Arial, sans-serif", padding: "24px 16px 80px" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: "#00C8FF", fontSize: 13, marginBottom: 16, cursor: "pointer", padding: 0 }}>
+          ← Inicio
+        </button>
+        <h2 style={{ color: "#fff", fontSize: 19, fontWeight: 800, marginBottom: 14 }}>¿Para quién es este perfil?</h2>
+
+        <button
+          onClick={onCrearNueva}
+          style={{ width: "100%", padding: "14px", background: "#8BFF00", color: "#000", border: "none", borderRadius: 12, fontWeight: 800, fontSize: 14, cursor: "pointer", marginBottom: 18 }}
+        >
+          + Persona Nueva
+        </button>
+
+        <input
+          placeholder="Buscar persona existente..."
+          value={busqueda}
+          onChange={(e) => setBusqueda(e.target.value)}
+          style={{ ...inputStyle(), marginBottom: 14 }}
+        />
+
+        {loading && <p style={{ color: "#888", fontSize: 13, textAlign: "center" }}>Cargando...</p>}
+
+        {!loading &&
+          filtradas.map((p) => (
+            <div
+              key={p.id}
+              onClick={() => onSelect(p)}
+              style={{ background: "#0d0d0d", border: "1px solid #1c1c1c", borderRadius: 12, padding: 14, marginBottom: 8, cursor: "pointer" }}
+            >
+              <div style={{ color: "#fff", fontWeight: 700, fontSize: 15 }}>{p.nombre}</div>
+              <div style={{ marginTop: 4 }}>
+                <EstatusBadge estatus={p.estatus} />
+              </div>
+            </div>
+          ))}
+      </div>
+    </div>
+  );
+}
+
 export default function EvolxiaApp() {
-  const [mode, setMode] = useState(null);
+  const [screen, setScreen] = useState("home"); // home | personas | detalle | seleccionar | nuevaPersona | formulario | reporte
+  const [personaActiva, setPersonaActiva] = useState(null);
+  const [historialPersonaActiva, setHistorialPersonaActiva] = useState([]);
   const [form, setForm] = useState(initialForm);
-  const [submitted, setSubmitted] = useState(false);
 
   const update = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const canSubmit = form.nombre && form.fechaNacimiento && form.alturaPies && form.peso;
 
-  function handleSubmit() {
-    if (canSubmit) setSubmitted(true);
+  function irAFormularioConPersona(persona) {
+    setPersonaActiva(persona);
+    setForm((f) => ({
+      ...f,
+      nombre: persona.nombre,
+      fechaNacimiento: persona.fecha_nacimiento || "",
+      sexo: persona.sexo || "F",
+    }));
+    listarPerfilesDePersona(persona.id)
+      .then(setHistorialPersonaActiva)
+      .catch(() => setHistorialPersonaActiva([]));
+    setScreen("formulario");
   }
 
-  if (!mode) return <ModeSelect onSelect={setMode} />;
-  if (!submitted)
+  function handleSubmit() {
+    if (canSubmit) setScreen("reporte");
+  }
+
+  if (screen === "home") {
+    return <HomeScreen onVerPersonas={() => setScreen("personas")} onNuevoPerfil={() => setScreen("seleccionar")} />;
+  }
+
+  if (screen === "personas") {
     return (
-      <FormScreen mode={mode} form={form} update={update} onBack={() => setMode(null)} onSubmit={handleSubmit} canSubmit={canSubmit} />
+      <PersonasScreen
+        onBack={() => setScreen("home")}
+        onNuevoPerfil={() => setScreen("seleccionar")}
+        onSelectPersona={(p) => {
+          setPersonaActiva(p);
+          setScreen("detalle");
+        }}
+      />
     );
+  }
+
+  if (screen === "detalle") {
+    return (
+      <PersonaDetailScreen
+        persona={personaActiva}
+        onBack={() => setScreen("personas")}
+        onNuevoPerfil={(p) => irAFormularioConPersona(p)}
+      />
+    );
+  }
+
+  if (screen === "seleccionar") {
+    return (
+      <SeleccionarPersonaScreen
+        onBack={() => setScreen("home")}
+        onCrearNueva={() => setScreen("nuevaPersona")}
+        onSelect={(p) => irAFormularioConPersona(p)}
+      />
+    );
+  }
+
+  if (screen === "nuevaPersona") {
+    return (
+      <NuevaPersonaScreen
+        onBack={() => setScreen("seleccionar")}
+        onCreada={(p) => irAFormularioConPersona(p)}
+      />
+    );
+  }
+
+  if (screen === "formulario") {
+    return (
+      <FormScreen
+        mode="coach"
+        form={form}
+        update={update}
+        onBack={() => setScreen("seleccionar")}
+        onSubmit={handleSubmit}
+        canSubmit={canSubmit}
+      />
+    );
+  }
 
   return (
     <ReportScreen
       form={form}
-      onEdit={() => setSubmitted(false)}
+      persona={personaActiva}
+      historialPrevio={historialPersonaActiva}
+      onEdit={() => setScreen("formulario")}
       onRestart={() => {
         setForm(initialForm);
-        setSubmitted(false);
-        setMode(null);
+        setPersonaActiva(null);
+        setHistorialPersonaActiva([]);
+        setScreen("home");
+      }}
+      onVerPersona={(p) => {
+        setPersonaActiva(p);
+        setScreen("detalle");
       }}
     />
   );
